@@ -50,9 +50,9 @@ CLEAN_UNSUPPORTED=1
 # ----------------------------
 # Environment setup (edit as needed)
 # ----------------------------
-# module purge
-# module load Miniforge3
-# conda activate ael-test
+module purge
+module load Miniforge3
+conda activate ael-test
 
 # ----------------------------
 # Helpers
@@ -167,6 +167,12 @@ done
 mkdir -p "$OUTDIR"
 
 # ----------------------------
+# Timing setup
+# ----------------------------
+JOB_START=$(date +%s)
+TIMING_CSV="$OUTDIR/aescore_${EXPERIMENT}_timing.csv"
+
+# ----------------------------
 # Working dirs / per-task output
 # ----------------------------
 WORKDIR="${SLURM_TMPDIR:-$OUTDIR/work}"
@@ -239,6 +245,8 @@ fi
 # ----------------------------
 # Build dataset file (+ optional cleaned inputs)
 # ----------------------------
+PREP_START=$(date +%s)
+
 : > "$DATASET_FILE"
 kept=0
 missing=0
@@ -281,11 +289,14 @@ while IFS= read -r id; do
   ((kept+=1))
 done < <(sed -n "${START},${END}p" "$ID_LIST_FILE")
 
+PREP_END=$(date +%s)
+PREP_TIME=$(( PREP_END - PREP_START ))
+
 echo "Dataset entries written: $kept (skipped/missing: $missing)" | tee -a "$RUN_LOG"
 [[ "$kept" -gt 0 ]] || die "No valid complexes in selected range."
 
 # ----------------------------
-# Run prediction (all models at once -> predict.csv has predicted_0..predicted_4 + avg/std)
+# Run prediction (all models at once)
 # ----------------------------
 PRED_ARGS=()
 if [[ "$FORCE_CPU" -eq 1 ]]; then
@@ -302,6 +313,8 @@ if [[ "$CLEAN_UNSUPPORTED" -eq 1 ]]; then
 fi
 
 echo "Running ael.predict with models: ${MODELS[*]}" | tee -a "$RUN_LOG"
+
+INF_START=$(date +%s)
 (
   cd "$AESCORE_DIR"
   python -m ael.predict \
@@ -316,6 +329,11 @@ echo "Running ael.predict with models: ${MODELS[*]}" | tee -a "$RUN_LOG"
     -o "$TASK_OUTDIR" \
     "${PRED_ARGS[@]}"
 ) 2>&1 | tee -a "$RUN_LOG"
+INF_END=$(date +%s)
+INF_TIME=$(( INF_END - INF_START ))
+
+JOB_END=$(date +%s)
+TOTAL_TIME=$(( JOB_END - JOB_START ))
 
 PRED_CSV="$(find "$TASK_OUTDIR" -maxdepth 2 -type f -name "predict.csv" -print -quit || true)"
 if [[ -n "$PRED_CSV" ]]; then
@@ -324,6 +342,18 @@ else
   echo "Finished, but predict.csv was not found under: $TASK_OUTDIR" | tee -a "$RUN_LOG"
 fi
 
+# ----------------------------
+# Append timing row
+# ----------------------------
+if [[ ! -f "$TIMING_CSV" ]]; then
+  echo "experiment,job_id,task_id,n_complexes,prep_seconds,inference_seconds,total_seconds,slurm_nodelist" > "$TIMING_CSV"
+fi
+
+echo "${EXPERIMENT},${JOB_ID},${TASK_ID},${kept},${PREP_TIME},${INF_TIME},${TOTAL_TIME},${SLURM_NODELIST:-unknown}" >> "$TIMING_CSV"
+
+# ----------------------------
+# Cleanup
+# ----------------------------
 if [[ "$KEEP_DATASET" -eq 0 ]]; then
   rm -f "$DATASET_FILE" "$ID_LIST_FILE" || true
 fi
