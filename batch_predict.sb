@@ -1,0 +1,329 @@
+#!/bin/bash --login
+#SBATCH --job-name=aescore_pred
+#SBATCH --time=04:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=16G
+#SBATCH --output=%x_%j.out
+#SBATCH --error=%x_%j.err
+## Optional GPU request (uncomment if you want GPU)
+##SBATCH --gres=gpu:1
+##SBATCH --partition=gpu
+## Optional array (uncomment if you want GPU + split IDs; keep in mind outputs are per-task)
+##SBATCH --array=1-2
+
+set -euo pipefail
+
+# ----------------------------
+# User configuration (your paths)
+# ----------------------------
+AESCORE_DIR="/mnt/scratch/jeaves/aescore"
+DATA_ROOT="/mnt/scratch/jeaves/aescore/coreset"
+OUTDIR="/mnt/scratch/jeaves/aescore/outputs"
+
+AEV_PATH="/mnt/scratch/jeaves/aescore/experiments/CASF16-consensus-nohetatm-PH/out/aevc.pth"
+AMAP_PATH="/mnt/scratch/jeaves/aescore/experiments/CASF16-consensus-nohetatm-PH/out/amap.json"
+
+# Model directory and which folds to run
+MODEL_DIR="/mnt/scratch/jeaves/aescore/experiments/CASF16-consensus-nohetatm-PH/out"
+MODEL_BASENAME="best"         # produces best_0.pth ... best_4.pth
+MODEL_START=0
+MODEL_END=4
+
+DISTANCE="5.0"
+BATCH="64"
+EXPERIMENT="best0to4_crystals"
+
+LABELS_CSV=""      # optional: CSV with header: pdbid,label
+FORCE_CPU=0
+
+PROTEIN_PATTERN="{id}_protein.pdb"
+LIGAND_PATTERNS="{id}_ligand.sdf,{id}_ligand.mol2,{id}_ligand.pdb"
+
+SKIP_MISSING=1
+KEEP_DATASET=0
+
+CHUNK_SIZE=200     # if using --array
+
+# Strip receptor atoms whose elements are not present in AMAP (prevents Zn/metal KeyError)
+CLEAN_UNSUPPORTED=1
+
+# ----------------------------
+# Environment setup (edit as needed)
+# ----------------------------
+# module purge
+# module load Miniforge3
+# conda activate ael-test
+
+# ----------------------------
+# Helpers
+# ----------------------------
+die() { echo "ERROR: $*" >&2; exit 2; }
+
+replace_id() {
+  local pattern="$1"
+  local id="$2"
+  echo "${pattern//\{id\}/$id}"
+}
+
+find_first_existing() {
+  local base_dir="$1"
+  local id="$2"
+  local patterns_csv="$3"
+  IFS=',' read -r -a pats <<< "$patterns_csv"
+  for p in "${pats[@]}"; do
+    local rel
+    rel="$(replace_id "$p" "$id")"
+    if [[ -f "$base_dir/$rel" ]]; then
+      echo "$rel"
+      return 0
+    fi
+  done
+  return 1
+}
+
+get_allowed_elements_from_amap() {
+  local amap="$1"
+  python - <<'PY' "$amap"
+import json, sys
+amap_path = sys.argv[1]
+amap = json.load(open(amap_path))
+
+nums = []
+for k in amap.keys():
+  try:
+    nums.append(int(k))
+  except Exception:
+    pass
+
+pt = [None,
+"H","He","Li","Be","B","C","N","O","F","Ne",
+"Na","Mg","Al","Si","P","S","Cl","Ar","K","Ca",
+"Sc","Ti","V","Cr","Mn","Fe","Co","Ni","Cu","Zn",
+"Ga","Ge","As","Se","Br","Kr","Rb","Sr","Y","Zr",
+"Nb","Mo","Tc","Ru","Rh","Pd","Ag","Cd","In","Sn",
+"Sb","Te","I","Xe","Cs","Ba","La","Ce","Pr","Nd",
+"Pm","Sm","Eu","Gd","Tb","Dy","Ho","Er","Tm","Yb",
+"Lu","Hf","Ta","W","Re","Os","Ir","Pt","Au","Hg",
+"Tl","Pb","Bi","Po","At","Rn","Fr","Ra","Ac","Th",
+"Pa","U","Np","Pu","Am","Cm","Bk","Cf","Es","Fm",
+"Md","No","Lr","Rf","Db","Sg","Bh","Hs","Mt","Ds",
+"Rg","Cn","Nh","Fl","Mc","Lv","Ts","Og"
+]
+syms = set()
+for n in nums:
+  if 1 <= n < len(pt) and pt[n]:
+    syms.add(pt[n].upper())
+print(" ".join(sorted(syms)))
+PY
+}
+
+strip_pdb_by_allowed_elements() {
+  local in_pdb="$1"
+  local out_pdb="$2"
+  shift 2
+  local allowed_elems=("$@")
+
+  awk -v allow_list="${allowed_elems[*]}" '
+    function trim(s){ gsub(/^ +| +$/,"",s); return s }
+    function init_allow() {
+      n = split(allow_list, a, " ")
+      for (i=1; i<=n; i++) if (a[i] != "") allow[toupper(a[i])] = 1
+    }
+    function infer_elem_from_atomname(atomname) {
+      atomname = toupper(trim(atomname))
+      if (atomname ~ /^(CL|BR|NA|MG|AL|SI|CA|FE|ZN|CU|NI|CO|MN|SE|HG|PB|CD|SR|CS|LI|BE|BA|AG|AU|PT|PD|SN|SB|BI|AS)$/) return atomname
+      return substr(atomname,1,1)
+    }
+    BEGIN { init_allow() }
+    /^ATOM  |^HETATM/ {
+      elem = toupper(trim(substr($0,77,2)))
+      if (elem == "") elem = infer_elem_from_atomname(substr($0,13,4))
+      if (allow[elem]) print
+      next
+    }
+    { print }
+  ' "$in_pdb" > "$out_pdb"
+}
+
+# ----------------------------
+# Checks
+# ----------------------------
+[[ -d "$AESCORE_DIR" ]] || die "AESCORE_DIR not found: $AESCORE_DIR"
+[[ -d "$DATA_ROOT"   ]] || die "DATA_ROOT not found: $DATA_ROOT"
+[[ -n "$OUTDIR"      ]] || die "OUTDIR not set"
+[[ -f "$AEV_PATH"    ]] || die "AEV_PATH not found: $AEV_PATH"
+[[ -f "$AMAP_PATH"   ]] || die "AMAP_PATH not found: $AMAP_PATH"
+[[ -d "$MODEL_DIR"   ]] || die "MODEL_DIR not found: $MODEL_DIR"
+if [[ -n "$LABELS_CSV" ]]; then [[ -f "$LABELS_CSV" ]] || die "LABELS_CSV not found: $LABELS_CSV"; fi
+
+# Collect models best_0..best_4
+MODELS=()
+for i in $(seq "$MODEL_START" "$MODEL_END"); do
+  f="$MODEL_DIR/${MODEL_BASENAME}_${i}.pth"
+  [[ -f "$f" ]] || die "Model not found: $f"
+  MODELS+=("$f")
+done
+
+mkdir -p "$OUTDIR"
+
+# ----------------------------
+# Working dirs / per-task output
+# ----------------------------
+WORKDIR="${SLURM_TMPDIR:-$OUTDIR/work}"
+mkdir -p "$WORKDIR"
+
+STAMP="$(date +%Y%m%d_%H%M%S)"
+TASK_ID="${SLURM_ARRAY_TASK_ID:-1}"
+JOB_ID="${SLURM_JOB_ID:-local}"
+
+TASK_OUTDIR="$OUTDIR/${EXPERIMENT}/task${TASK_ID}"
+mkdir -p "$TASK_OUTDIR"
+
+ID_LIST_FILE="$WORKDIR/aescore_ids_${JOB_ID}.txt"
+DATASET_FILE="$WORKDIR/aescore_${EXPERIMENT}_${JOB_ID}_task${TASK_ID}.dat"
+RUN_LOG="$TASK_OUTDIR/run_${EXPERIMENT}_${JOB_ID}_task${TASK_ID}_${STAMP}.log"
+
+CLEAN_ROOT="$WORKDIR/clean_inputs"
+
+# ----------------------------
+# Build list of complex IDs
+# ----------------------------
+find "$DATA_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort > "$ID_LIST_FILE"
+TOTAL_IDS="$(wc -l < "$ID_LIST_FILE" | tr -d '[:space:]')"
+[[ "$TOTAL_IDS" -gt 0 ]] || die "No subdirectories found under DATA_ROOT: $DATA_ROOT"
+
+START=$(( (TASK_ID - 1) * CHUNK_SIZE + 1 ))
+END=$(( TASK_ID * CHUNK_SIZE ))
+if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+  echo "Array task ${TASK_ID}: processing IDs ${START}-${END} of ${TOTAL_IDS}" | tee -a "$RUN_LOG"
+else
+  START=1
+  END="$TOTAL_IDS"
+  echo "Single task: processing all ${TOTAL_IDS} IDs" | tee -a "$RUN_LOG"
+fi
+
+# ----------------------------
+# Optional labels map
+# ----------------------------
+declare -A LABEL_MAP=()
+if [[ -n "$LABELS_CSV" ]]; then
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ ^[Pp][Dd][Bb][Ii][Dd] ]] && continue
+
+    if [[ "$line" == *","* ]]; then
+      pdbid="${line%%,*}"
+      label="${line#*,}"
+    else
+      pdbid="$(awk '{print $1}' <<<"$line")"
+      label="$(awk '{print $2}' <<<"$line")"
+    fi
+
+    pdbid="$(echo "$pdbid" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+    label="$(echo "$label" | tr -d '[:space:]')"
+    [[ -n "$pdbid" && -n "$label" ]] && LABEL_MAP["$pdbid"]="$label"
+  done < "$LABELS_CSV"
+fi
+
+# ----------------------------
+# Allowed elements (from AMAP) and cleaned root
+# ----------------------------
+ALLOWED_ELEMS=()
+if [[ "$CLEAN_UNSUPPORTED" -eq 1 ]]; then
+  allowed_str="$(get_allowed_elements_from_amap "$AMAP_PATH")"
+  read -r -a ALLOWED_ELEMS <<< "$allowed_str"
+  echo "CLEAN_UNSUPPORTED=1; allowed elements from AMAP: ${ALLOWED_ELEMS[*]}" | tee -a "$RUN_LOG"
+  mkdir -p "$CLEAN_ROOT"
+fi
+
+# ----------------------------
+# Build dataset file (+ optional cleaned inputs)
+# ----------------------------
+: > "$DATASET_FILE"
+kept=0
+missing=0
+
+while IFS= read -r id; do
+  [[ -z "$id" ]] && continue
+  id_lc="$(echo "$id" | tr '[:upper:]' '[:lower:]')"
+  complex_dir="$DATA_ROOT/$id"
+
+  rec_rel="$(replace_id "$PROTEIN_PATTERN" "$id_lc")"
+  rec_abs="$complex_dir/$rec_rel"
+
+  if [[ ! -f "$rec_abs" ]]; then
+    echo "WARN: missing receptor: $rec_abs" | tee -a "$RUN_LOG"
+    ((missing+=1))
+    [[ "$SKIP_MISSING" -eq 1 ]] && continue
+  fi
+
+  if lig_rel="$(find_first_existing "$complex_dir" "$id_lc" "$LIGAND_PATTERNS")"; then
+    :
+  else
+    echo "WARN: missing ligand in $complex_dir (tried: $LIGAND_PATTERNS)" | tee -a "$RUN_LOG"
+    ((missing+=1))
+    [[ "$SKIP_MISSING" -eq 1 ]] && continue
+  fi
+
+  label="0.0"
+  if [[ -n "$LABELS_CSV" && -n "${LABEL_MAP[$id_lc]:-}" ]]; then
+    label="${LABEL_MAP[$id_lc]}"
+  fi
+
+  if [[ "$CLEAN_UNSUPPORTED" -eq 1 ]]; then
+    mkdir -p "$CLEAN_ROOT/$id"
+    strip_pdb_by_allowed_elements "$rec_abs" "$CLEAN_ROOT/$id/$rec_rel" "${ALLOWED_ELEMS[@]}"
+    mkdir -p "$(dirname "$CLEAN_ROOT/$id/$lig_rel")"
+    ln -sf "$complex_dir/$lig_rel" "$CLEAN_ROOT/$id/$lig_rel"
+  fi
+
+  echo "$label $id/$rec_rel $id/$lig_rel" >> "$DATASET_FILE"
+  ((kept+=1))
+done < <(sed -n "${START},${END}p" "$ID_LIST_FILE")
+
+echo "Dataset entries written: $kept (skipped/missing: $missing)" | tee -a "$RUN_LOG"
+[[ "$kept" -gt 0 ]] || die "No valid complexes in selected range."
+
+# ----------------------------
+# Run prediction (all models at once -> predict.csv has predicted_0..predicted_4 + avg/std)
+# ----------------------------
+PRED_ARGS=()
+if [[ "$FORCE_CPU" -eq 1 ]]; then
+  PRED_ARGS+=(--cpu)
+fi
+if (cd "$AESCORE_DIR" && python -m ael.predict --help 2>/dev/null | grep -q -- '--workers'); then
+  PRED_ARGS+=(--workers "${SLURM_CPUS_PER_TASK:-8}")
+fi
+
+DATAPATH="$DATA_ROOT"
+if [[ "$CLEAN_UNSUPPORTED" -eq 1 ]]; then
+  DATAPATH="$CLEAN_ROOT"
+  echo "Using cleaned datapath: $DATAPATH" | tee -a "$RUN_LOG"
+fi
+
+echo "Running ael.predict with models: ${MODELS[*]}" | tee -a "$RUN_LOG"
+(
+  cd "$AESCORE_DIR"
+  python -m ael.predict \
+    "$EXPERIMENT" \
+    "$DATASET_FILE" \
+    "${MODELS[@]}" \
+    -d "$DATAPATH" \
+    -e "$AEV_PATH" \
+    -am "$AMAP_PATH" \
+    -r "$DISTANCE" \
+    -b "$BATCH" \
+    -o "$TASK_OUTDIR" \
+    "${PRED_ARGS[@]}"
+) 2>&1 | tee -a "$RUN_LOG"
+
+PRED_CSV="$(find "$TASK_OUTDIR" -maxdepth 2 -type f -name "predict.csv" -print -quit || true)"
+if [[ -n "$PRED_CSV" ]]; then
+  echo "Predictions written to: $PRED_CSV" | tee -a "$RUN_LOG"
+else
+  echo "Finished, but predict.csv was not found under: $TASK_OUTDIR" | tee -a "$RUN_LOG"
+fi
+
+if [[ "$KEEP_DATASET" -eq 0 ]]; then
+  rm -f "$DATASET_FILE" "$ID_LIST_FILE" || true
+fi
